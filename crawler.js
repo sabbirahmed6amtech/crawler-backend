@@ -1,6 +1,9 @@
 /**
- * Crawler module — same logic as original, refactored to be callable
- * and emit progress events via a callback instead of console.log
+ * Crawler module
+ * Improvements:
+ * - Retry failed links up to 2 times before marking broken
+ * - Always emits a report even on crash/stop (via finally block)
+ * - Report: click URL to copy, open button to redirect with full URL
  */
 
 let puppeteer, got;
@@ -9,6 +12,9 @@ try {
   got = require("got");
   if (got.default) got = got.default;
 } catch { throw new Error("got not installed"); }
+
+const RETRY_LIMIT = 2;
+const RETRY_DELAY_MS = 1500;
 
 const DEFAULT_CONFIG = {
   maxPages: 100,
@@ -40,11 +46,12 @@ function normalise(url) {
   catch { return null; }
 }
 
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
 async function runCrawler(userConfig, emit) {
   const CONFIG = {
     ...DEFAULT_CONFIG,
     ...userConfig,
-    // Merge pattern arrays (user can pass serialised strings; skip if not arrays)
     noCrawlPatterns: DEFAULT_CONFIG.noCrawlPatterns,
     ignorePatterns: DEFAULT_CONFIG.ignorePatterns,
   };
@@ -54,74 +61,99 @@ async function runCrawler(userConfig, emit) {
   const linkResults = new Map();
   const queue = [];
   let pageCount = 0;
-  let brokenCount = 0;
   let sessionCookies = "";
 
   const shouldIgnore = (url) => CONFIG.ignorePatterns.some((p) => p.test(url));
   const shouldNotCrawl = (url) => CONFIG.noCrawlPatterns.some((p) => p.test(url));
-
   const log = (msg) => emit({ type: "progress", message: msg });
 
-  // ── Login ────────────────────────────────────────────────────────────────
+  // ── Always emit report regardless of how crawl ends ───────────────────────
+  function emitReport(label) {
+    const all = [...linkResults.values()];
+    const broken = all.filter((r) => r.broken);
+    const ok = all.filter((r) => !r.broken);
+    log(`\n${label}  Pages: ${pageCount}  |  Links: ${all.length}  |  Broken: ${broken.length}`);
+    const stats = { pages: pageCount, total: all.length, broken: broken.length, ok: ok.length };
+    const report = buildReport({ all, broken, ok, pageCount, origin, startUrl: CONFIG.startUrl });
+    emit({ type: "done", report, stats });
+  }
+
+  // ── Login ─────────────────────────────────────────────────────────────────
   async function login(browser) {
     log("🔐  Logging in…");
     const page = await browser.newPage();
-    await page.goto(CONFIG.loginUrl, { waitUntil: "networkidle2", timeout: CONFIG.pageTimeout });
+    try {
+      await page.goto(CONFIG.loginUrl, { waitUntil: "networkidle2", timeout: CONFIG.pageTimeout });
 
-    const usernameSelector = CONFIG.usernameSelector || "input[name=email], input[type=email]";
-    const passwordSelector = CONFIG.passwordSelector || "input[name=password], input[type=password]";
-    const submitSelector = CONFIG.submitSelector || "button[type=submit], input[type=submit]";
-    const postLoginSelector = CONFIG.postLoginSelector || "nav, .sidebar, .navbar, main, #app";
+      const usernameSelector = CONFIG.usernameSelector || "input[name=email], input[type=email]";
+      const passwordSelector = CONFIG.passwordSelector || "input[name=password], input[type=password]";
+      const submitSelector = CONFIG.submitSelector || "button[type=submit], input[type=submit]";
+      const postLoginSelector = CONFIG.postLoginSelector || "nav, .sidebar, .navbar, main, #app";
 
-    await page.waitForSelector(usernameSelector, { timeout: 8000 });
-    await page.type(usernameSelector, CONFIG.username, { delay: 40 });
-    await page.type(passwordSelector, CONFIG.password, { delay: 40 });
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: CONFIG.pageTimeout }).catch(() => {}),
-      page.click(submitSelector),
-    ]);
-    await page.waitForSelector(postLoginSelector, { timeout: CONFIG.pageTimeout }).catch(() => {});
-    log(`✅  Logged in → ${page.url()}`);
-
-    const cookies = await page.cookies();
-    sessionCookies = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-    await page.close();
+      await page.waitForSelector(usernameSelector, { timeout: 8000 });
+      await page.type(usernameSelector, CONFIG.username, { delay: 40 });
+      await page.type(passwordSelector, CONFIG.password, { delay: 40 });
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle2", timeout: CONFIG.pageTimeout }).catch(() => {}),
+        page.click(submitSelector),
+      ]);
+      await page.waitForSelector(postLoginSelector, { timeout: CONFIG.pageTimeout }).catch(() => {});
+      log(`✅  Logged in → ${page.url()}`);
+      const cookies = await page.cookies();
+      sessionCookies = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    } finally {
+      await page.close();
+    }
   }
 
-  // ── Fast HTTP link check ─────────────────────────────────────────────────
-  async function checkLinkFast(url, foundOn) {
-    if (linkResults.has(url)) return;
-    const start = Date.now();
-    try {
-      const res = await got.head(url, {
+  // ── Single attempt ────────────────────────────────────────────────────────
+  async function checkLinkOnce(url) {
+    const res = await got.head(url, {
+      timeout: { request: CONFIG.checkTimeout },
+      followRedirect: true,
+      throwHttpErrors: false,
+      headers: { Cookie: sessionCookies, "User-Agent": "Mozilla/5.0 (compatible; LinkChecker/2.0)" },
+    });
+    let status = res.statusCode;
+    if (status === 405) {
+      const res2 = await got.get(url, {
         timeout: { request: CONFIG.checkTimeout },
         followRedirect: true,
         throwHttpErrors: false,
-        headers: { Cookie: sessionCookies, "User-Agent": "Mozilla/5.0 (compatible; LinkChecker/2.0)" },
+        headers: { Cookie: sessionCookies, "User-Agent": "Mozilla/5.0" },
       });
-      let status = res.statusCode;
-      if (status === 405) {
-        const res2 = await got.get(url, {
-          timeout: { request: CONFIG.checkTimeout },
-          followRedirect: true,
-          throwHttpErrors: false,
-          headers: { Cookie: sessionCookies, "User-Agent": "Mozilla/5.0" },
-        });
-        status = res2.statusCode;
-      }
-      const broken = status >= 400;
-      const ms = Date.now() - start;
-      linkResults.set(url, { url, status, broken, foundOn, ms });
-      if (broken) {
-        brokenCount++;
-        log(`❌  ${status}  ${url.replace(origin, "")}  (on: ${foundOn.replace(origin, "")})`);
-      }
-    } catch (e) {
-      const status = e.code === "ETIMEDOUT" || e.code === "ETIMEOUT" ? "TIMEOUT" : "ERR";
-      linkResults.set(url, { url, status, broken: true, foundOn, ms: Date.now() - start });
-      brokenCount++;
-      log(`❌  ${status}  ${url.replace(origin, "")}`);
+      status = res2.statusCode;
     }
+    return status;
+  }
+
+  // ── Check link with retry ─────────────────────────────────────────────────
+  async function checkLinkFast(url, foundOn) {
+    if (linkResults.has(url)) return;
+    const start = Date.now();
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= RETRY_LIMIT + 1; attempt++) {
+      try {
+        const status = await checkLinkOnce(url);
+        const broken = status >= 400;
+        linkResults.set(url, { url, status, broken, foundOn, ms: Date.now() - start });
+        if (broken) {
+          log(`❌  ${status}  ${url.replace(origin, "")}  (on: ${foundOn.replace(origin, "")})`);
+        }
+        return;
+      } catch (e) {
+        lastError = e;
+        if (attempt <= RETRY_LIMIT) {
+          log(`⟳   Retry ${attempt}/${RETRY_LIMIT}  ${url.replace(origin, "")}`);
+          await sleep(RETRY_DELAY_MS * attempt);
+        }
+      }
+    }
+
+    const status = lastError?.code === "ETIMEDOUT" || lastError?.code === "ETIMEOUT" ? "TIMEOUT" : "ERR";
+    linkResults.set(url, { url, status, broken: true, foundOn, ms: Date.now() - start });
+    log(`❌  ${status} (after ${RETRY_LIMIT} retries)  ${url.replace(origin, "")}`);
   }
 
   async function checkLinksBatch(links, foundOn) {
@@ -133,7 +165,7 @@ async function runCrawler(userConfig, emit) {
     }
   }
 
-  // ── Crawl a page ─────────────────────────────────────────────────────────
+  // ── Crawl a single page ───────────────────────────────────────────────────
   async function crawlPage(browser, url) {
     if (visited.has(url)) return [];
     visited.add(url);
@@ -146,19 +178,16 @@ async function runCrawler(userConfig, emit) {
       const status = res ? res.status() : 0;
 
       if (status >= 400) {
-        brokenCount++;
         log(`❌  ${status}  ${url.replace(origin, "")}  (page itself)`);
         linkResults.set(url, { url, status, broken: true, foundOn: "crawl-queue", ms: 0 });
-        await page.close();
         return [];
       }
 
-      await new Promise((r) => setTimeout(r, CONFIG.actionDelay));
+      await sleep(CONFIG.actionDelay);
 
       const hrefs = await page.evaluate(() =>
         [...document.querySelectorAll("a[href]")].map((a) => a.href)
       );
-      await page.close();
 
       const links = [];
       for (const href of hrefs) {
@@ -169,13 +198,14 @@ async function runCrawler(userConfig, emit) {
       }
       return [...new Set(links)];
     } catch (e) {
-      await page.close();
       log(`⚠️   Skipped (error): ${url.replace(origin, "")}`);
       return [];
+    } finally {
+      await page.close().catch(() => {});
     }
   }
 
-  // ── Main crawl loop ───────────────────────────────────────────────────────
+  // ── Main loop ─────────────────────────────────────────────────────────────
   const browser = await puppeteer.launch({
     headless: "new",
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
@@ -202,29 +232,17 @@ async function runCrawler(userConfig, emit) {
         }
       }
     }
+
+    emitReport("✅  Done!");
+  } catch (e) {
+    log(`\n⚠️  Crawler error: ${e.message} — saving partial report…`);
+    emitReport("⚠️  Partial.");
   } finally {
-    await browser.close();
+    await browser.close().catch(() => {});
   }
-
-  const all = [...linkResults.values()];
-  const broken = all.filter((r) => r.broken);
-  const ok = all.filter((r) => !r.broken);
-
-  log(`\n✅  Done!  Pages: ${pageCount}  |  Links: ${all.length}  |  Broken: ${broken.length}`);
-
-  const stats = {
-    pages: pageCount,
-    total: all.length,
-    broken: broken.length,
-    ok: ok.length,
-  };
-
-  const report = buildReport({ all, broken, ok, pageCount, origin, startUrl: CONFIG.startUrl });
-
-  emit({ type: "done", report, stats });
 }
 
-// ── HTML Report builder ───────────────────────────────────────────────────────
+// ── HTML Report ───────────────────────────────────────────────────────────────
 function buildReport({ all, broken, ok, pageCount, origin, startUrl }) {
   const byPage = {};
   for (const r of broken) {
@@ -236,42 +254,38 @@ function buildReport({ all, broken, ok, pageCount, origin, startUrl }) {
   const sc = (s) =>
     s === 500 ? "#c0392b" : s === 404 ? "#e67e22" : s === 403 ? "#8e44ad" : "#7f8c8d";
 
-  const tableRows = broken
-    .map(
-      (r) => `
+  const urlCell = (r) => `
+    <td class="url-cell">
+      <span class="mono url-text" title="Click to copy" onclick="copyUrl('${r.url}',this)">${r.url.replace(origin, "")}</span>
+      <a class="open-btn" href="${r.url}" target="_blank" rel="noopener" title="Open URL">↗</a>
+    </td>`;
+
+  const tableRows = broken.map((r) => `
     <tr data-status="${r.status}">
       <td><span class="badge" style="background:${sc(r.status)}">${r.status}</span></td>
-      <td class="mono">${r.url.replace(origin, "")}</td>
+      ${urlCell(r)}
       <td class="mono muted">${(r.foundOn || "").replace(origin, "")}</td>
       <td class="muted">${r.ms}ms</td>
-    </tr>`
-    )
-    .join("");
+    </tr>`).join("");
 
   const groupedHtml = Object.entries(byPage)
     .sort((a, b) => b[1].length - a[1].length)
-    .map(
-      ([page, items]) => `
+    .map(([page, items]) => `
     <div class="group">
       <div class="group-header">
         <span class="mono">${page}</span>
         <span class="badge-sm">${items.length} broken</span>
       </div>
       <div class="group-body">
-        ${items
-          .map(
-            (r) => `
+        ${items.map((r) => `
           <div class="group-row">
             <span class="badge" style="background:${sc(r.status)}">${r.status}</span>
-            <span class="mono">${r.url.replace(origin, "")}</span>
+            <span class="mono url-text" title="Click to copy" onclick="copyUrl('${r.url}',this)">${r.url.replace(origin, "")}</span>
+            <a class="open-btn" href="${r.url}" target="_blank" rel="noopener" title="Open URL">↗</a>
             <span class="muted">${r.ms}ms</span>
-          </div>`
-          )
-          .join("")}
+          </div>`).join("")}
       </div>
-    </div>`
-    )
-    .join("");
+    </div>`).join("");
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -288,8 +302,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
 .stat{background:#f8fafc;border-radius:8px;padding:14px 18px;border:1px solid #e2e8f0}
 .stat .n{font-size:28px;font-weight:700;line-height:1}
 .stat .l{font-size:11px;color:#64748b;margin-top:3px;text-transform:uppercase;letter-spacing:.04em}
-.stat.red .n{color:#dc2626}
-.stat.green .n{color:#16a34a}
+.stat.red .n{color:#dc2626}.stat.green .n{color:#16a34a}
 .tabs{display:flex;background:#fff;border-bottom:1px solid #e2e8f0;padding:0 32px}
 .tab{padding:11px 18px;cursor:pointer;font-size:12px;font-weight:500;color:#64748b;border-bottom:2px solid transparent}
 .tab.on{color:#1a1a2e;border-bottom-color:#1a1a2e}
@@ -306,6 +319,12 @@ tr:hover td{background:#fafafa}
 .badge-sm{background:#fee2e2;color:#dc2626;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600}
 .mono{font-family:monospace;font-size:12px;word-break:break-all}
 .muted{color:#94a3b8;font-size:11px}
+.url-cell{display:flex;align-items:center;gap:8px}
+.url-text{cursor:pointer;transition:color .15s}
+.url-text:hover{color:#2563eb}
+.url-text.copied{color:#16a34a}
+.open-btn{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:4px;background:#f1f5f9;color:#475569;text-decoration:none;font-size:12px;flex-shrink:0;border:1px solid #e2e8f0;transition:all .15s}
+.open-btn:hover{background:#dbeafe;color:#2563eb;border-color:#bfdbfe}
 .group{background:#fff;border-radius:8px;margin-bottom:10px;border:1px solid #e2e8f0;overflow:hidden}
 .group-header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;cursor:pointer}
 .group-body{padding:0}
@@ -313,9 +332,12 @@ tr:hover td{background:#fafafa}
 .group-row:last-child{border-bottom:none}
 .empty{text-align:center;padding:60px;color:#94a3b8;font-size:15px}
 input[type=text]{padding:6px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:12px;width:320px;background:#fff;outline:none}
+#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1a1a2e;color:#fff;padding:8px 18px;border-radius:20px;font-size:12px;opacity:0;transition:opacity .2s;pointer-events:none}
+#toast.show{opacity:1}
 </style>
 </head>
 <body>
+<div id="toast">Copied!</div>
 <div class="topbar">
   <div><h1>Broken Link Report</h1><p>${startUrl} &nbsp;·&nbsp; ${new Date().toLocaleString()}</p></div>
   <div style="font-size:12px;color:#8892b0">${pageCount} pages crawled</div>
@@ -361,7 +383,10 @@ input[type=text]{padding:6px 12px;border:1px solid #e2e8f0;border-radius:6px;fon
     <thead><tr><th>Status</th><th>URL</th><th>Time</th></tr></thead>
     <tbody>${ok.map((r) => `<tr>
       <td><span class="badge" style="background:#16a34a">${r.status}</span></td>
-      <td class="mono">${r.url.replace(origin, "")}</td>
+      <td class="url-cell">
+        <span class="mono url-text" title="Click to copy" onclick="copyUrl('${r.url}',this)">${r.url.replace(origin, "")}</span>
+        <a class="open-btn" href="${r.url}" target="_blank" rel="noopener">↗</a>
+      </td>
       <td class="muted">${r.ms}ms</td>
     </tr>`).join("")}</tbody>
   </table>
@@ -372,6 +397,17 @@ function tFilter(s,btn){document.querySelectorAll('.filters .f').forEach(b=>b.cl
 function searchTable(){const q=document.getElementById('search').value.toLowerCase();document.querySelectorAll('#btable tbody tr').forEach(r=>{r.style.display=r.innerText.toLowerCase().includes(q)?'':'none';});}
 function gFilter(s,btn){document.querySelectorAll('.filters .f').forEach(b=>b.classList.remove('on'));btn.classList.add('on');document.querySelectorAll('.group').forEach(g=>{const rows=g.querySelectorAll('.group-row');let v=0;rows.forEach(r=>{const st=r.querySelector('.badge').textContent;const show=(s==='all'||st===s);r.style.display=show?'':'none';if(show)v++;});g.style.display=v?'':'none';});}
 document.querySelectorAll('.group-header').forEach(h=>{h.addEventListener('click',()=>{const b=h.nextElementSibling;b.style.display=b.style.display==='none'?'':'none';});});
+let toastTimer;
+function copyUrl(url,el){
+  navigator.clipboard.writeText(url).then(()=>{
+    el.classList.add('copied');
+    setTimeout(()=>el.classList.remove('copied'),1500);
+    const t=document.getElementById('toast');
+    t.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer=setTimeout(()=>t.classList.remove('show'),1800);
+  });
+}
 </script>
 </body></html>`;
 }
