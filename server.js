@@ -14,7 +14,7 @@ app.use(express.json());
 
 // In-memory job store (Railway is ephemeral — fine for this use case)
 const jobs = new Map();
-// { id, status: 'queued'|'running'|'done'|'error', progress: [], report: '', stats: {}, config: {} }
+// { id, status: 'queued'|'running'|'done'|'stopped'|'error', stopRequested: bool, progress: [], report: '', stats: {} }
 
 // ── POST /api/crawl — start a new job ────────────────────────────────────────
 app.post("/api/crawl", (req, res) => {
@@ -29,6 +29,7 @@ app.post("/api/crawl", (req, res) => {
   jobs.set(id, {
     id,
     status: "queued",
+    stopRequested: false,
     progress: [],
     report: null,
     stats: null,
@@ -45,16 +46,16 @@ app.post("/api/crawl", (req, res) => {
       // Keep last 500 messages to avoid memory bloat
       if (job.progress.length > 500) job.progress = job.progress.slice(-500);
     } else if (event.type === "done") {
-      job.status = "done";
+      job.status = job.stopRequested ? "stopped" : "done";
       job.report = event.report;
       job.stats = event.stats;
     } else if (event.type === "error") {
       job.status = "error";
       job.progress.push("ERROR: " + event.message);
     }
-  }).then(() => {
+  }, () => jobs.get(id)?.stopRequested).then(() => {
     const job = jobs.get(id);
-    if (job && job.status !== "done") job.status = "error";
+    if (job && job.status !== "done" && job.status !== "stopped") job.status = "error";
   }).catch((e) => {
     const job = jobs.get(id);
     if (job) {
@@ -94,7 +95,7 @@ app.get("/api/crawl/:id/stream", (req, res) => {
       lastSent = j.progress.length;
     }
 
-    if (j.status === "done") {
+    if (j.status === "done" || j.status === "stopped") {
       send({ type: "done", stats: j.stats });
       clearInterval(interval);
       res.end();
@@ -112,7 +113,7 @@ app.get("/api/crawl/:id/stream", (req, res) => {
 app.get("/api/crawl/:id/report", (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found" });
-  if (job.status !== "done") return res.status(202).json({ error: "Not ready yet" });
+  if (job.status !== "done" && job.status !== "stopped") return res.status(202).json({ error: "Not ready yet" });
   res.setHeader("Content-Type", "text/html");
   res.send(job.report);
 });
@@ -122,6 +123,15 @@ app.get("/api/crawl/:id/status", (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found" });
   res.json({ id: job.id, status: job.status, stats: job.stats });
+});
+
+// ── POST /api/crawl/:id/stop — request graceful stop ─────────────────────────
+app.post("/api/crawl/:id/stop", (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: "Job not found" });
+  if (job.status !== "running") return res.json({ ok: true, note: "Job not running" });
+  job.stopRequested = true;
+  res.json({ ok: true });
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
