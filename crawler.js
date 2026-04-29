@@ -48,7 +48,7 @@ function normalise(url) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-async function runCrawler(userConfig, emit) {
+async function runCrawler(userConfig, emit, shouldStop = () => false) {
   const CONFIG = {
     ...DEFAULT_CONFIG,
     ...userConfig,
@@ -220,6 +220,11 @@ async function runCrawler(userConfig, emit) {
     log(`\n🕷️  Crawling ${CONFIG.startUrl}  (max ${CONFIG.maxPages} pages)\n`);
 
     while (queue.length && pageCount < CONFIG.maxPages) {
+      if (shouldStop()) {
+        log("\n🛑  Stop requested — saving report…");
+        break;
+      }
+
       const url = queue.shift();
       if (visited.has(url)) continue;
 
