@@ -1,6 +1,7 @@
 /**
  * Broken Link Crawler — Backend API
  * Railway deployment
+ * Uses polling instead of SSE to avoid Railway HTTP/2 connection drops
  */
 
 const express = require("express");
@@ -12,15 +13,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// In-memory job store (Railway is ephemeral — fine for this use case)
+// In-memory job store
+// { id, status: 'queued'|'running'|'done'|'stopped'|'error', stopRequested, progress[], report, stats }
 const jobs = new Map();
-// { id, status: 'queued'|'running'|'done'|'stopped'|'error', stopRequested: bool, progress: [], report: '', stats: {} }
 
 // ── POST /api/crawl — start a new job ────────────────────────────────────────
 app.post("/api/crawl", (req, res) => {
   const config = req.body;
-
-  // Basic validation
   if (!config.startUrl || !config.loginUrl) {
     return res.status(400).json({ error: "startUrl and loginUrl are required" });
   }
@@ -36,14 +35,11 @@ app.post("/api/crawl", (req, res) => {
     startedAt: Date.now(),
   });
 
-  // Run async — don't await
   runCrawler(config, (event) => {
     const job = jobs.get(id);
     if (!job) return;
-
     if (event.type === "progress") {
       job.progress.push(event.message);
-      // Keep last 500 messages to avoid memory bloat
       if (job.progress.length > 500) job.progress = job.progress.slice(-500);
     } else if (event.type === "done") {
       job.status = job.stopRequested ? "stopped" : "done";
@@ -64,56 +60,35 @@ app.post("/api/crawl", (req, res) => {
     }
   });
 
-  const job = jobs.get(id);
-  job.status = "running";
-
+  jobs.get(id).status = "running";
   res.json({ id });
 });
 
-// ── GET /api/crawl/:id/stream — SSE progress stream ──────────────────────────
-app.get("/api/crawl/:id/stream", (req, res) => {
+// ── GET /api/crawl/:id/poll — polling endpoint ────────────────────────────────
+// Frontend calls this every 1.5s with ?since=N to get new log lines from index N
+// Replaces SSE — avoids Railway HTTP/2 long-connection drops
+app.get("/api/crawl/:id/poll", (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found" });
 
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders();
+  const since = parseInt(req.query.since) || 0;
+  const newLines = job.progress.slice(since);
 
-  let lastSent = 0;
-
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
-  const interval = setInterval(() => {
-    const j = jobs.get(req.params.id);
-    if (!j) { clearInterval(interval); res.end(); return; }
-
-    // Send any new progress lines
-    const newLines = j.progress.slice(lastSent);
-    if (newLines.length) {
-      newLines.forEach((msg) => send({ type: "progress", message: msg }));
-      lastSent = j.progress.length;
-    }
-
-    if (j.status === "done" || j.status === "stopped") {
-      send({ type: "done", stats: j.stats });
-      clearInterval(interval);
-      res.end();
-    } else if (j.status === "error") {
-      send({ type: "error" });
-      clearInterval(interval);
-      res.end();
-    }
-  }, 300);
-
-  req.on("close", () => clearInterval(interval));
+  res.json({
+    lines: newLines,
+    cursor: job.progress.length,
+    status: job.status,
+    stats: job.stats || null,
+  });
 });
 
 // ── GET /api/crawl/:id/report — fetch the HTML report ────────────────────────
 app.get("/api/crawl/:id/report", (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: "Job not found" });
-  if (job.status !== "done" && job.status !== "stopped") return res.status(202).json({ error: "Not ready yet" });
+  if (job.status !== "done" && job.status !== "stopped") {
+    return res.status(202).json({ error: "Not ready yet", status: job.status });
+  }
   res.setHeader("Content-Type", "text/html");
   res.send(job.report);
 });
