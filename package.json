@@ -1,0 +1,20 @@
+{
+  "name": "crawler-backend",
+  "version": "1.0.0",
+  "description": "Broken link crawler API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "got": "^11.8.6",
+    "puppeteer": "^21.0.0",
+    "uuid": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
